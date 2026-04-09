@@ -33,6 +33,9 @@ typedef struct
 
 static uint32_t extract_operand_value(uint32_t, const bal_decoder_operand_t *);
 static uint32_t intern_constant(bal_translation_context_t *, bal_constant_t);
+static void     translate_add(bal_translation_context_t                *context,
+                              const bal_decoder_instruction_metadata_t *metadata,
+                              const uint32_t                           *arm_registers);
 static void     translate_const(bal_translation_context_t *,
                                 const bal_decoder_instruction_metadata_t *,
                                 const uint32_t *);
@@ -259,6 +262,9 @@ bal_engine_translate(bal_engine_t *BAL_RESTRICT                 engine,
 
             switch (metadata->ir_opcode)
             {
+                case OPCODE_ADD:
+                    translate_add(&context, metadata, arm_instruction_operands);
+                    break;
                 case OPCODE_CONST:
                     translate_const(&context, metadata, arm_instruction_operands);
                     break;
@@ -420,6 +426,74 @@ get_or_create_ssa_index(bal_translation_context_t *context, const uint64_t regis
     context->ir_instruction_cursor++;
     context->bit_width_cursor++;
     return ssa_index;
+}
+
+BAL_HOT static void
+translate_add(bal_translation_context_t                *context,
+              const bal_decoder_instruction_metadata_t *metadata,
+              const uint32_t                           *arm_registers)
+{
+    const uint64_t rd = arm_registers[0];
+    const uint64_t rn = arm_registers[1];
+    const uint64_t sh = arm_registers[3];
+
+    // Add Immediate instruction.
+    //
+    if (BAL_OPERAND_TYPE_IMMEDIATE == metadata->operands[2].type)
+    {
+        const uint64_t imm12 = arm_registers[2];
+        const uint64_t shift = 1 == sh ? 12 : 0;
+        const uint64_t value = imm12 << shift;
+        BAL_LOG_TRACE(context->logger,
+                      "  Variant='Imm' Rd=%lu Rn=%lu Imm12=0x%lX Shift=%lu Value=0x%llX",
+                      rd,
+                      rn,
+                      imm12,
+                      shift,
+                      value);
+        const uint64_t rn_ssa_index_with_flag = get_or_create_ssa_index(context, rn);
+        const uint64_t rn_ssa_index    = rn_ssa_index_with_flag & ~BAL_IS_CONSTANT_BIT_POSITION;
+        const uint64_t imm12_ssa_index = intern_constant(context, value);
+
+        if (BAL_UNLIKELY(context->status != BAL_SUCCESS))
+        {
+            return;
+        }
+
+        *context->ir_instruction_cursor = (bal_instruction_t)OPCODE_ADD << BAL_OPCODE_SHIFT_POSITION
+                                          | rn_ssa_index << BAL_SOURCE1_SHIFT_POSITION
+                                          | imm12_ssa_index << BAL_SOURCE2_SHIFT_POSITION;
+        bal_bit_width_t bit_width = 0;
+
+        if (BAL_OPERAND_TYPE_REGISTER_32 == metadata->operands[0].type)
+        {
+            bit_width = 32;
+        }
+        else if (BAL_OPERAND_TYPE_REGISTER_64 == metadata->operands[0].type)
+        {
+            bit_width = 64;
+        }
+        else
+        {
+            BAL_LOG_ERROR(context->logger, "Unknown register type for ADD (Imm) Rd register");
+            context->status = BAL_ERROR_INCORRECT_REGISTER_TYPE;
+            return;
+        }
+
+        *context->bit_width_cursor = bit_width;
+        BAL_LOG_DEBUG(context->logger,
+                      "  EMIT: v%u = ADD v%u, c%u (%u-bit)",
+                      context->instruction_count,
+                      rn_ssa_index,
+                      imm12_ssa_index & ~BAL_IS_CONSTANT_BIT_POSITION,
+                      bit_width);
+
+        context->source_variables[rd].current_ssa_index = context->instruction_count;
+        BAL_LOG_TRACE(
+            context->logger, "  SSA UPDATE: X%lu -> v%lu", rd, context->instruction_count);
+    }
+
+    context->instruction_count++;
 }
 
 BAL_HOT static void
